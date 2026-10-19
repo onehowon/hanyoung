@@ -3,6 +3,12 @@ import Cocoa
 
 /// 키 입력을 지켜보다가 띄어쓰기 순간 방금 친 단어를 판단하고, 잘못된 언어면 지우고 다시 입력한다.
 final class AutoSwitch {
+    /// 방금 바꾼 것. 바로 ⌫를 누르면 original로 되돌리고 word는 앞으로 안 바꾼다
+    struct Undo {
+        let word: String, original: String, replacement: String
+        let source: TISInputSource
+    }
+
     let detector: Detector
     var enabled = true
     var onChange: (() -> Void)?
@@ -10,9 +16,10 @@ final class AutoSwitch {
 
     private var tap: CFMachPort?
     private var keys = ""        // 지금 치는 단어의 물리 키 입력 (쉬프트면 대문자)
+    private var tail = ""        // 단어 뒤에 붙은 문장부호 ("gody?"의 "?")
     private var clean = true     // 글자 키만 쳤는지. 숫자, 기호, 백스페이스가 섞이면 이번 단어는 건드리지 않는다
     private var previous = 0     // 앞 단어의 언어: 영어 +1, 한글 -1
-    private var undoable: (original: String, replacement: String, source: TISInputSource)?
+    private var undoable: Undo?
     private var ignored: Set<String>
 
     private let marker: Int64 = 0x4859_4F55  // 우리가 보낸 키 이벤트 표시
@@ -23,6 +30,10 @@ final class AutoSwitch {
     private let excludedApps: Set<String> = [
         "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "dev.warp.Warp-Stable",
         "com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92", "com.apple.dt.Xcode", "com.jetbrains.intellij",
+    ]
+    // 단어 끝에 붙는 문장부호: 키 코드 -> (그냥, 쉬프트). 두벌식도 영문 자판과 같은 기호가 나온다
+    private let punctuation: [Int64: (Character, Character)] = [
+        47: (".", ">"), 43: (",", "<"), 44: ("/", "?"), 18: ("1", "!"), 41: (";", ":"), 39: ("'", "\""),
     ]
     // ANSI 배열의 키 코드 -> 글자
     private let letters: [Int64: Character] = [
@@ -60,6 +71,7 @@ final class AutoSwitch {
                                           userInfo: Unmanaged.passUnretained(self).toOpaque()) else { return false }
         self.tap = tap
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+        log("시작")
         return true
     }
 
@@ -83,14 +95,19 @@ final class AutoSwitch {
                 return true
             }
             // 영문은 한 번에 한 글자, 한글 입력기는 상황에 따라 자모나 글자 단위로 지워서 키 입력과 맞추기 어렵다
-            if !keys.isEmpty, !isKorean(currentSource()) { keys.removeLast() } else { clean = false }
+            if !tail.isEmpty { tail.removeLast() }
+            else if !keys.isEmpty, !isKorean(currentSource()) { keys.removeLast() }
+            else { clean = false }
         case 36, 48, 53, 76, 115...126:  // return, tab, esc, enter, 이동 키
             reset()
         default:
-            if let ch = letters[code] {
-                keys.append(flags.contains(.maskShift) ? Character(ch.uppercased()) : ch)
+            let shift = flags.contains(.maskShift)
+            if let ch = letters[code], tail.isEmpty {
+                keys.append(shift ? Character(ch.uppercased()) : ch)
+            } else if let p = punctuation[code], !keys.isEmpty {
+                tail.append(shift ? p.1 : p.0)
             } else {
-                clean = false
+                clean = false  // 숫자, 기호 사이에 낀 글자 등은 일부러 친 것이다
             }
         }
         return false
@@ -98,6 +115,7 @@ final class AutoSwitch {
 
     private func reset() {
         keys = ""
+        tail = ""
         clean = true
     }
 
@@ -109,23 +127,26 @@ final class AutoSwitch {
         let current = currentSource()
         let korean = isKorean(current)
         if korean && !sourceID(current).contains("2Set") { return }  // 두벌식만 지원
-        let onScreen = korean ? Hangul.compose(keys).text : keys
-        if ignored.contains(onScreen) { return }
+        let word = korean ? Hangul.compose(keys).text : keys
+        if ignored.contains(word) { return }
+        let onScreen = word + tail
 
         let d = detector.decide(onScreen, neighbors: previous)
         previous = detector.language(of: d)
+        log("\(onScreen) [\(korean ? "한" : "영")] → \(d.action) \(d.output) \(String(format: "%.1f", d.confidence))")
         guard d.action == .toEnglish || d.action == .toKorean,
               let target = d.action == .toKorean ? koreanSource() : englishSource() else { return }
 
         replace(count: onScreen.count + 1, with: d.output + " ", then: target)
-        undoable = (onScreen, d.output, current)
+        undoable = Undo(word: word, original: onScreen, replacement: d.output, source: current)
         lastChange = (onScreen, d.output)
         onChange?()
     }
 
     /// 변환 직후 백스페이스: 원래대로 되돌리고 그 단어는 앞으로 바꾸지 않는다
-    private func undo(_ u: (original: String, replacement: String, source: TISInputSource)) {
-        ignored.insert(u.original)
+    private func undo(_ u: Undo) {
+        log("되돌림: \(u.replacement) → \(u.original)")
+        ignored.insert(u.word)
         try? FileManager.default.createDirectory(at: ignoredURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? ignored.sorted().joined(separator: "\n").write(to: ignoredURL, atomically: true, encoding: .utf8)
         replace(count: u.replacement.count + 1, with: u.original, then: u.source)
@@ -164,6 +185,19 @@ final class AutoSwitch {
             e.setIntegerValueField(.eventSourceUserData, value: marker)
             e.post(tap: .cgSessionEventTap)
         }
+    }
+
+    private let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Hanyoung.log")
+
+    private func log(_ message: String) {
+        let line = "\(Date().formatted(.iso8601)) \(message)\n"
+        guard let h = try? FileHandle(forWritingTo: logURL) else {
+            try? line.write(to: logURL, atomically: true, encoding: .utf8)
+            return
+        }
+        h.seekToEndOfFile()
+        h.write(line.data(using: .utf8)!)
+        try? h.close()
     }
 
     // MARK: 입력 소스
